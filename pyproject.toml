@@ -1,0 +1,15 @@
+[project]
+name = "dance-notation-etl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.6",
+    "matplotlib>=3.10.9",
+    "pyqt6>=6.11.0",
+    "notebook>=7.5.6",
+    "scipy>=1.17.1",
+    "bvhio>=1.5.4",
+    "pyglm>=2.8.2",
+]
