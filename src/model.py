@@ -32,6 +32,16 @@ def convertBvhToHierarchy(bvh: bvhio.BvhContainer, frame: int = 0) -> kn.Joint:
     return root
 
 
+# New idea: Node(N) = Transform(0) + Transform(N),
+#           Diff = Node(1) - Node(2)
+#                = (Transform(0) + Transform(1))
+#                   - (Transform(0) + Transform(1))
+#                = Transform(1) - Transform(2)
+# Note: (-) here actually means: delta of HTM, which is T1^-1 * T2
+# So, frames = ( Transform(0), [Node(1), Node(2), ..., Node(N)] )
+# We can then get velocity as a vector from previos frame, and current
+
+
 def load_model(
     bvh_model: str,
     frameMap: Callable[[kn.Joint], kn.Joint] = None
