@@ -12,4 +12,5 @@ dependencies = [
     "scipy>=1.17.1",
     "bvhio>=1.5.4",
     "pyglm>=2.8.2",
+    "ipympl>=0.10.0",
 ]

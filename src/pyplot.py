@@ -1,11 +1,25 @@
+"""pyplot.py — 3-D skeleton animation using Matplotlib.
+
+Single public function:
+
+    plot_skeleton(frames) → FuncAnimation
+
+It pre-computes all world-space joint positions up-front in one top-down tree
+walk per frame (bypassing the cached .root HTM property to avoid redundant
+matrix multiplications), then drives a Matplotlib FuncAnimation at ~60 fps.
+
+Coordinate remapping
+--------------------
+BVH/kinematics uses the convention  X = right, Y = up, Z = forward.
+Matplotlib's 3-D axes use            X = right, Y = depth, Z = up.
+The plotter therefore maps  bvh-Y → mpl-Z  and  bvh-Z → mpl-Y, with the
+Y-axis inverted so that "forward" points into the screen.
+"""
+
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
 from kinematics import Joint
 from matplotlib.animation import FuncAnimation
-
-# Configuration
-matplotlib.use('QtAgg')
 
 
 # Graph plotting helpers
@@ -122,4 +136,5 @@ def plot_skeleton(frames: list[Joint]):
         fig, update, frames=frame_count, interval=16, blit=False
     )
     plt.show()
+
     return ani
