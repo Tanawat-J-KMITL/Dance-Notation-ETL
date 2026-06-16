@@ -216,17 +216,20 @@ class LiveDTW:
         joint_ids: list[str] | None = None,
         lin_weight: float = 1.0,
         ang_weight: float = 1.0,
+        max_frames: int | None = None,
+        band: int | None = None,
     ):
         ids    = joint_ids or reference._joint_ids
         id_map = {jid: j for j, jid in enumerate(reference._joint_ids)}
         idx    = [id_map[jid] for jid in ids]
 
-        self._ref_lin   = reference._lin[:, idx]   # (N, J, 3)
-        self._ref_ang   = reference._ang[:, idx]   # (N, J, 4)
+        self._ref_lin   = reference._lin[:max_frames, idx]   # (N, J, 3)
+        self._ref_ang   = reference._ang[:max_frames, idx]   # (N, J, 4)
         self._joint_ids = ids
         self._lin_w     = lin_weight
         self._ang_w     = ang_weight
         self._N         = len(self._ref_lin)
+        self._band      = band if band is not None else self._N  # unconstrained = full N
         self._j         = 0
         self._incr      = float("inf")
         self._col       = self._init_col()
@@ -256,13 +259,16 @@ class LiveDTW:
         ang_c = np.arccos(np.clip(np.abs(dot), 0.0, 1.0)).sum(axis=-1)
         cost = self._lin_w * lin_c + self._ang_w * ang_c   # (N,)
 
-        # Sequential column update.  curr[i] = cost[i-1] + min(prev[i],
-        # curr[i-1], prev[i-1]).  curr[i] depends on curr[i-1], so this loop
-        # cannot be replaced by a numpy vectorised op.
+        # Sequential column update with optional Sakoe-Chiba band.
+        # Cells outside |i - j| > band are set to inf, preventing the path
+        # from compressing the match window to fewer than N - band frames.
+        j    = self._j + 1  # 1-indexed live frame about to be processed
         prev = self._col
-        curr = np.empty(self._N + 1)
-        curr[0] = np.inf
-        for i in range(1, self._N + 1):
+        curr = np.full(self._N + 1, np.inf)
+        curr[0] = 0.0   # subsequence DTW: D[0,j]=0 for all j
+        lo = max(1, j - self._band)
+        hi = min(self._N, j + self._band)
+        for i in range(lo, hi + 1):
             curr[i] = cost[i - 1] + min(prev[i], curr[i - 1], prev[i - 1])
 
         prev_cost    = float(self._col[self._N])
@@ -294,6 +300,18 @@ class LiveDTW:
     def cost(self) -> float:
         """Raw accumulated DTW cost D[N, j] after j live frames."""
         return float(self._col[self._N])
+
+    @property
+    def subseq_distance(self) -> float:
+        """Best-match cost normalised by reference length N.
+
+        With subsequence-DTW initialisation (curr[0]=0), D[N,j] is the
+        minimum cost of aligning the full N-frame reference to *any*
+        contiguous window of live frames ending at j.  Dividing by N
+        gives a per-reference-frame average that is low when the current
+        live motion matches the reference and high otherwise.
+        """
+        return float(self._col[self._N]) / self._N if self._N else 0.0
 
     @property
     def distance(self) -> float:

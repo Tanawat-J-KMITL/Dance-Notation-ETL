@@ -1,34 +1,25 @@
-"""pyplot.py — 3-D skeleton animation using Matplotlib.
+"""pyplot.py — 3-D skeleton animation using Plotly.
 
 Single public function:
 
-    plot_skeleton(frames) → FuncAnimation
-
-It pre-computes all world-space joint positions up-front in one top-down tree
-walk per frame (bypassing the cached .root HTM property to avoid redundant
-matrix multiplications), then drives a Matplotlib FuncAnimation at ~60 fps.
+    plot_skeleton(frames) → go.Figure
 
 Coordinate remapping
 --------------------
 BVH/kinematics uses the convention  X = right, Y = up, Z = forward.
-Matplotlib's 3-D axes use            X = right, Y = depth, Z = up.
-The plotter therefore maps  bvh-Y → mpl-Z  and  bvh-Z → mpl-Y, with the
-Y-axis inverted so that "forward" points into the screen.
+The plotter maps  bvh-Y → plot-Z  and  bvh-Z → plot-Y (inverted) so
+that "forward" points into the screen, matching the old matplotlib view.
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from kinematics import Joint
-from matplotlib.animation import FuncAnimation
 
 
-# Graph plotting helpers
 def extract_joints_and_bones(
-    root: Joint
+    root: Joint,
 ) -> tuple[list[Joint], list[tuple[Joint, Joint]]]:
-    """Flatten the Joint tree -> list of joints & parent-child bone pairs."""
-    joints = []
-    bones  = []
+    joints, bones = [], []
 
     def _walk(joint: Joint):
         joints.append(joint)
@@ -43,28 +34,17 @@ def extract_joints_and_bones(
 def extract_positions_optimized(
     frames: list[Joint], joints: list[Joint]
 ) -> np.ndarray:
-    """
-    Computes world positions using a single top-down tree walk per frame.
-    Bypasses the expensive recursive HTM .root property.
-    """
     joint_count = len(joints)
     frame_count = len(frames)
     positions   = np.zeros((frame_count, joint_count, 3))
-
-    # Map joint IDs to flat array indices for O(1) filling
-    idx_of = {j.id: i for i, j in enumerate(joints)}
+    idx_of      = {j.id: i for i, j in enumerate(joints)}
 
     for f, frame_root in enumerate(frames):
-        def _walk_and_compute(joint: Joint, parent_world: np.ndarray):
-            # Compute world transform downstream linearly
+        def _walk_and_compute(joint: Joint, parent_world):
             local_T = joint.transform.local
-            world_T = local_T if parent_world \
-                is None else parent_world @ local_T
-
-            # Save world position directly
+            world_T = local_T if parent_world is None else parent_world @ local_T
             if joint.id in idx_of:
                 positions[f, idx_of[joint.id]] = world_T[:3, 3]
-
             for child in joint.children:
                 _walk_and_compute(child, world_T)
 
@@ -73,68 +53,86 @@ def extract_positions_optimized(
     return positions
 
 
+def _bone_segments(pts_x, pts_y, pts_z, bone_indices):
+    """Interleave None separators so a single Scatter3d draws all bones."""
+    xs, ys, zs = [], [], []
+    for pi, ci in bone_indices:
+        xs += [float(pts_x[pi]), float(pts_x[ci]), None]
+        ys += [float(pts_y[pi]), float(pts_y[ci]), None]
+        zs += [float(pts_z[pi]), float(pts_z[ci]), None]
+    return xs, ys, zs
+
+
 def plot_skeleton(frames: list[Joint]):
-    """Animate a list of per-frame Joint trees with optimized lookups."""
+    """Animate a list of per-frame Joint trees using a Plotly figure."""
     if not frames:
         return
 
-    # ── 1. Precalculate Topology & Positions Once ─────────────────────
     joints, bones = extract_joints_and_bones(frames[0])
     positions     = extract_positions_optimized(frames, joints)
     frame_count   = len(frames)
+    idx_of        = {j.id: i for i, j in enumerate(joints)}
+    bone_indices  = [(idx_of[p.id], idx_of[c.id]) for p, c in bones]
 
-    # Precalculate flat array indices for bones to keep the animation loop fast
-    idx_of       = {j.id: i for i, j in enumerate(joints)}
-    bone_indices = [(idx_of[p.id], idx_of[c.id]) for p, c in bones]
+    # Coordinate remap: bvh-Y → plot-Z,  bvh-Z → plot-Y (inverted)
+    px_ = positions[:, :, 0]
+    py_ = -positions[:, :, 2]
+    pz_ = positions[:, :, 1]
 
-    # ── 2. Figure Setup ───────────────────────────────────────────────
-    fig = plt.figure(figsize=(8, 8))
-    ax  = fig.add_subplot(111, projection='3d')
+    def frame_traces(f):
+        bx, by, bz = _bone_segments(px_[f], py_[f], pz_[f], bone_indices)
+        return [
+            go.Scatter3d(x=px_[f], y=py_[f], z=pz_[f],
+                         mode="markers", marker=dict(size=4, color="red"),
+                         name="joints", showlegend=False),
+            go.Scatter3d(x=bx, y=by, z=bz,
+                         mode="lines", line=dict(color="black", width=2),
+                         name="bones", showlegend=False),
+        ]
 
-    mn  = positions.reshape(-1, 3).min(axis=0)
-    mx  = positions.reshape(-1, 3).max(axis=0)
-    pad = (mx - mn).max() * 0.1
+    anim_frames = [
+        go.Frame(data=frame_traces(f), name=str(f))
+        for f in range(frame_count)
+    ]
 
-    mid_x = (mx[0] + mn[0]) / 2
-    mid_y = (mx[1] + mn[1]) / 2
-    mid_z = (mx[2] + mn[2]) / 2
+    flat   = positions.reshape(-1, 3)
+    mn, mx = flat.min(axis=0), flat.max(axis=0)
+    mid    = (mn + mx) / 2
+    half   = ((mx - mn).max() / 2) * 1.1
 
-    # Find the maximum span across any axis and add padding
-    max_range = (mx - mn).max()
-    half_extent = (max_range / 2) + pad
-
-    ax.set_xlim(mid_x - half_extent, mid_x + half_extent)
-    ax.set_ylim(mid_z - half_extent, mid_z + half_extent)  # Z → matplotlib Y
-    ax.set_zlim(mid_y - half_extent, mid_y + half_extent)  # Y → matplotlib Z
-
-    ax.set_box_aspect((1, 1, 1))
-    ax.invert_yaxis()
-    ax.set_xlabel('X')
-    ax.set_ylabel('Z')
-    ax.set_zlabel('Y')
-
-    scatter    = ax.scatter([], [], [], c='red', s=20)
-    bone_lines = [ax.plot([], [], [], c='black', lw=1)[0] for _ in bones]
-    title      = ax.set_title("")
-
-    # ── 3. Optimized Animation Callback ───────────────────────────────
-    def update(frame):
-        pts = positions[frame]
-
-        # Update joint dots (Swapping Y and Z)
-        scatter._offsets3d = (pts[:, 0], pts[:, 2], pts[:, 1])
-
-        # Update bone lines using precalculated integer indices
-        for line, (pi, ci) in zip(bone_lines, bone_indices):
-            line.set_data([pts[pi, 0], pts[ci, 0]], [pts[pi, 2], pts[ci, 2]])
-            line.set_3d_properties([pts[pi, 1], pts[ci, 1]])
-
-        title.set_text(f"Frame {frame}/{frame_count - 1}")
-        return [scatter, *bone_lines, title]
-
-    ani = FuncAnimation(
-        fig, update, frames=frame_count, interval=16, blit=False
+    fig = go.Figure(
+        data=frame_traces(0),
+        frames=anim_frames,
+        layout=go.Layout(
+            scene=dict(
+                xaxis=dict(range=[mid[0] - half, mid[0] + half], title="X"),
+                yaxis=dict(range=[-mid[2] - half, -mid[2] + half], title="Z (inv)"),
+                zaxis=dict(range=[mid[1] - half, mid[1] + half], title="Y"),
+                aspectmode="cube",
+            ),
+            updatemenus=[dict(
+                type="buttons", showactive=False,
+                buttons=[
+                    dict(label="Play", method="animate",
+                         args=[None, dict(frame=dict(duration=0.05, redraw=True),
+                                          fromcurrent=True)]),
+                    dict(label="Pause", method="animate",
+                         args=[[None], dict(frame=dict(duration=0, redraw=False),
+                                             mode="immediate")]),
+                ],
+            )],
+            sliders=[dict(
+                steps=[
+                    dict(method="animate",
+                         args=[[str(f)], dict(mode="immediate",
+                                              frame=dict(duration=0, redraw=True))],
+                         label=str(f))
+                    for f in range(frame_count)
+                ],
+                transition=dict(duration=0),
+                x=0, y=0, len=1.0,
+            )],
+        ),
     )
-    plt.show()
-
-    return ani
+    fig.show()
+    return fig

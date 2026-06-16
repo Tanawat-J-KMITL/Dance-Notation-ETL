@@ -1,19 +1,27 @@
-"""segmentation.py — Gait segmentation via LiveDTW with EMA smoothing.
+"""segmentation.py — Gait segmentation via subsequence LiveDTW.
 
 Overview
 --------
 Segments a motion stream into labelled gait events by comparing live frames
 against one or more reference recordings using online (streaming) DTW.
 
-The core signal is the **DTW increment**: the marginal change in cumulative
-cost when a new live frame arrives — ``D[N, j] - D[N, j-1]``, clipped to
-``[0, ∞)``.  During the reference motion the increment is near zero; during
-idle motion it is large.  An exponential moving average (EMA) smooths the
-signal before comparison.
+Detection pipeline
+------------------
+    raw subseq_distance  →  EMA smoothing  →  Otsu threshold  →  detect
 
-Each reference gait gets its own detection threshold, derived automatically
-from a calibration pass over a representative stream using Otsu's method on
-the bimodal increment distribution.
+For each live frame the raw ``LiveDTW.subseq_distance`` is fed through a
+per-gait exponential moving average (EMA).  During calibration:
+
+1. Raw ``subseq_distance`` is collected after a warmup of
+   ``max(reference_N) + WARMUP_FRAMES`` frames to let the DP settle.
+2. The EMA alpha that maximises Otsu's between-class variance on the
+   smoothed signal is auto-detected.
+3. Otsu's threshold is computed on that EMA-smoothed calibration signal.
+
+At detection time the same EMA (fresh start, same alpha) is applied
+frame-by-frame and the smoothed value is compared to the threshold.
+The EMA state is reset whenever a detection segment ends and the DTW
+probes are reset, so every segment starts with a clean slate.
 
 Typical usage
 -------------
@@ -26,26 +34,19 @@ Typical usage
     ref    = MotionStream("reference.bvh")
     stream = MotionStream("recording.bvh")
 
-    detector = seg.GaitDetector([(LiveDTW(ref), "Pick up")])
+    detector = seg.GaitDetector([(LiveDTW(ref), "Pick up")],
+                                detect_high=True)
     detector.calibrate(stream)
     segments = detector.detect(stream)
 
     for begin, end, label in segments:
         print(f"[{begin}:{end}] {label}")
 
-    # Or as a one-liner with method chaining:
-    segments = seg.GaitDetector(gaits).calibrate(stream).detect(stream)
-
 Constants
 ---------
-EMA_ALPHA : float
-    Default smoothing factor for the EMA applied to the raw DTW increment.
-    Lower values produce a smoother (but more lagged) signal.  Default: 0.04.
-
 WARMUP_FRAMES : int
-    Default number of frames to skip after ``frames_seen`` first reaches
-    ``N`` (the reference length).  At ``j == N`` the DTW always yields a
-    zero increment, which would be a false detection.  Default: 30.
+    Extra frames added on top of the reference length during warmup.
+    Default: 30.
 """
 
 import numpy as np
@@ -56,7 +57,6 @@ from motion import MotionStream
 
 # ── Module-level defaults ────────────────────────────────────────────────────
 
-EMA_ALPHA = 0.04
 WARMUP_FRAMES = 30
 
 _Gaits = list[tuple[LiveDTW, str]]
@@ -67,41 +67,41 @@ _Gaits = list[tuple[LiveDTW, str]]
 class GaitDetector:
     """Online gait segmentation against a fixed set of reference recordings.
 
-    Uses Dynamic Time Warping (DTW) increments smoothed with an exponential
-    moving average (EMA) to identify when a live motion stream matches a
-    reference gait.  Each reference gets its own detection threshold, derived
-    automatically by Otsu's method during calibration.
+    Pipeline: raw subseq_distance → EMA smoothing → Otsu threshold → detect.
+
+    The warmup defaults to ``max(reference_N) + WARMUP_FRAMES`` so the DP
+    is fully settled before any distance value is used.  The EMA alpha is
+    auto-detected during calibration by maximising Otsu's between-class
+    variance over a sweep of candidate values.
 
     State machine
     -------------
-    Two states: IDLE and ACTIVE.  At each frame every gait's EMA-smoothed
-    increment is divided by its threshold.  The gait with the lowest
-    normalised score wins.  Score ≤ 1.0 triggers ACTIVE; rising back above
-    1.0 returns to IDLE.  All DTW objects are reset on every state *exit*,
-    allowing the same gait to fire again (recurring detection).
+    Two states: IDLE and ACTIVE.  At each frame the EMA-smoothed distance
+    for the winning gait is compared to its threshold.  With
+    ``detect_high=False`` (default) score ≤ 1.0 triggers ACTIVE; with
+    ``detect_high=True`` score ≥ 1.0 triggers ACTIVE.  All DTW objects and
+    the EMA state are reset on every state exit so the same gait can fire
+    again cleanly.
 
     Parameters
     ----------
     gaits:
         List of ``(LiveDTW, label)`` pairs — one per reference recording.
-    ema_alpha:
-        EMA smoothing factor for the DTW increment signal.
-        Lower = smoother but more lag.  Defaults to ``EMA_ALPHA`` (0.04).
     warmup_frames:
-        Frames to ignore after the DTW warmup period ends.  Guards against
-        the artificial zero increment that occurs at ``j == N``.
-        Defaults to ``WARMUP_FRAMES`` (30).
+        Frames to skip before distances are used.  ``None`` (default)
+        auto-computes ``max(ref_N) + WARMUP_FRAMES`` across all gaits.
+    detect_high:
+        When ``True``, fire when EMA distance is *above* threshold.
+        Use when high distance indicates the target motion.
 
     Attributes
     ----------
     gaits : list[tuple[LiveDTW, str]]
-        The ``(LiveDTW, label)`` pairs supplied at construction.
     thresholds : list[float] or None
-        Per-gait Otsu thresholds; ``None`` until ``calibrate()`` is called.
-    ema_alpha : float
-        EMA smoothing factor in use.
+        Per-gait Otsu thresholds on the EMA-smoothed signal.
+    ema_alphas : list[float] or None
+        Per-gait auto-detected EMA smoothing factors.
     warmup_frames : int
-        Warmup guard length in use.
 
     Raises
     ------
@@ -112,107 +112,79 @@ class GaitDetector:
     def __init__(
         self,
         gaits: _Gaits,
-        ema_alpha: float = EMA_ALPHA,
-        warmup_frames: int = WARMUP_FRAMES,
+        warmup_frames: int | None = None,
+        detect_high: bool = False,
     ) -> None:
-        self.gaits = gaits
-        self.ema_alpha = ema_alpha
+        if warmup_frames is None:
+            warmup_frames = max(g._N for g, _ in gaits) + WARMUP_FRAMES
+        self.gaits         = gaits
         self.warmup_frames = warmup_frames
+        self.detect_high   = detect_high
         self.thresholds: list[float] | None = None
+        self.ema_alphas:  list[float] | None = None
 
     # ── Public API ───────────────────────────────────────────────────────────
 
     def calibrate(self, stream: MotionStream) -> "GaitDetector":
-        """Run a forward pass over *stream* to compute per-gait thresholds.
+        """Calibrate per-gait EMA alphas and Otsu thresholds.
 
-        Collects EMA-smoothed DTW increments for every gait over the full
-        stream, then applies Otsu's method independently to each gait's
-        distribution to find the threshold that best separates the motion
-        and idle modes.
+        Pipeline: collect raw subseq_distance → auto-detect EMA alpha →
+        apply EMA → Otsu threshold.
 
-        All gaits are reset after the pass so both *stream* and the detector
-        can be reused immediately for detection.
-
-        Parameters
-        ----------
-        stream:
-            A representative ``MotionStream`` to calibrate against.  It will
-            be iterated from its current position.
-
-        Returns
-        -------
-        GaitDetector
-            Returns *self* to allow method chaining.
+        Returns *self* for method chaining.
         """
-        gait_increments: list[list[float]] = [[] for _ in self.gaits]
-        ema = [np.nan] * len(self.gaits)
+        raw_dists: list[list[float]] = [[] for _ in self.gaits]
         for _, vel in stream:
             if vel is None:
                 continue
             for i, (gait, _) in enumerate(self.gaits):
                 gait.update(vel)
-                if gait.frames_seen >= gait._N + self.warmup_frames:
-                    raw = gait.increment
-                    if np.isnan(ema[i]):
-                        ema[i] = raw
-                    else:
-                        ema[i] = (
-                            self.ema_alpha * raw
-                            + (1 - self.ema_alpha) * ema[i]
-                        )
-                    gait_increments[i].append(ema[i])
+                if gait.frames_seen >= self.warmup_frames:
+                    raw_dists[i].append(gait.subseq_distance)
         self._reset()
+
+        # Auto-detect EMA alpha: maximise Otsu between-class variance
+        self.ema_alphas = []
+        for raw in raw_dists:
+            if len(raw) < 10:
+                self.ema_alphas.append(0.1)
+                continue
+            best_alpha, best_var = 0.1, -1.0
+            for a in np.linspace(0.01, 0.5, 40):
+                smoothed = np.array(self._apply_ema(raw, a))
+                v = self._otsu_between_class_var(smoothed)
+                if v > best_var:
+                    best_var, best_alpha = v, a
+            self.ema_alphas.append(best_alpha)
+
+        # Otsu threshold on EMA-smoothed calibration distribution
         self.thresholds = [
-            self._otsu_threshold(np.array(incs))
-            if len(incs) > 1 else np.inf
-            for incs in gait_increments
+            self._otsu_threshold(np.array(self._apply_ema(raw, a)))
+            if len(raw) > 1 else np.inf
+            for raw, a in zip(raw_dists, self.ema_alphas)
         ]
         return self
 
-    def detect(
-        self, stream: MotionStream
-    ) -> list[tuple[int, int, str]]:
+    def detect(self, stream: MotionStream) -> list[tuple[int, int, str]]:
         """Detect labelled gait segments in *stream*.
 
-        Iterates over *stream* frame by frame, maintaining per-gait EMA
-        state and a two-state (IDLE / ACTIVE) machine.
+        Applies per-gait EMA to ``subseq_distance`` in real time and runs
+        the two-state (IDLE / ACTIVE) machine against the calibrated
+        thresholds.  EMA state and DTW probes are both reset at segment
+        boundaries for a clean slate.
 
-        Gaits are reset on every state *exit* so the same label can fire
-        again once the motion resumes (recurring detection).  There is an
-        inherent dead zone of ``N + warmup_frames`` frames between
-        consecutive detections of the same gait.
-
-        Parameters
-        ----------
-        stream:
-            The ``MotionStream`` to segment.  Iterated from its current
-            position.
-
-        Returns
-        -------
-        list[tuple[int, int, str]]
-            ``(begin, end, label)`` tuples with **inclusive** frame indices,
-            in chronological order.
-
-        Raises
-        ------
-        RuntimeError
-            If ``calibrate()`` has not been called yet.
+        Raises ``RuntimeError`` if called before ``calibrate()``.
         """
         if self.thresholds is None:
             raise RuntimeError("call calibrate() before detect()")
+
         thresholds = self.thresholds
+        ema_states = [float("nan")] * len(self.gaits)
 
         detected: list[tuple[int, int, str]] = []
         last_label: str | None = None
         detection_begin = 0
         last_match_frame = 0
-        ema = [np.nan] * len(self.gaits)
-
-        def _clear() -> None:
-            nonlocal ema
-            self._reset()
-            ema = [np.nan] * len(self.gaits)
 
         for frame_index, (_, vel) in enumerate(stream):
             if vel is None:
@@ -220,37 +192,34 @@ class GaitDetector:
             for gait, _ in self.gaits:
                 gait.update(vel)
 
+            scores: list[float] = []
             for i, (g, _) in enumerate(self.gaits):
-                if g.frames_seen >= g._N + self.warmup_frames:
-                    raw = g.increment
-                    if np.isnan(ema[i]):
-                        ema[i] = raw
-                    else:
-                        ema[i] = (
-                            self.ema_alpha * raw
-                            + (1 - self.ema_alpha) * ema[i]
-                        )
+                if g.frames_seen >= self.warmup_frames:
+                    raw = g.subseq_distance
+                    a   = self.ema_alphas[i]
+                    ema_states[i] = (
+                        raw if np.isnan(ema_states[i])
+                        else a * raw + (1 - a) * ema_states[i]
+                    )
+                    scores.append(ema_states[i] / thresholds[i])
+                else:
+                    scores.append(0.0 if self.detect_high else np.inf)
 
-            scores = [
-                ema[i] / thresholds[i]
-                if (
-                    g.frames_seen >= g._N + self.warmup_frames
-                    and not np.isnan(ema[i])
-                )
-                else np.inf
-                for i, (g, _) in enumerate(self.gaits)
-            ]
             min_idx = int(np.argmin(scores))
             _, label = self.gaits[min_idx]
 
-            if scores[min_idx] <= 1.0:
+            triggered = (
+                scores[min_idx] >= 1.0 if self.detect_high
+                else scores[min_idx] <= 1.0
+            )
+            if triggered:
                 last_match_frame = frame_index
                 if label != last_label:
                     if last_label is not None:
                         detected.append(
                             (detection_begin, frame_index - 1, last_label)
                         )
-                        _clear()
+                        self._reset_all(ema_states)
                     detection_begin = frame_index
                     last_label = label
             else:
@@ -259,40 +228,49 @@ class GaitDetector:
                         (detection_begin, last_match_frame, last_label)
                     )
                     last_label = None
-                    _clear()
+                    self._reset_all(ema_states)
 
         if last_label is not None:
-            detected.append(
-                (detection_begin, last_match_frame, last_label)
-            )
-
+            detected.append((detection_begin, last_match_frame, last_label))
         self._reset()
         return detected
 
     # ── Private helpers ──────────────────────────────────────────────────────
 
     def _reset(self) -> None:
-        """Reset all LiveDTW objects to their initial state."""
         for gait, _ in self.gaits:
             gait.reset()
 
+    def _reset_all(self, ema_states: list) -> None:
+        """Reset DTW probes and clear EMA state for a clean segment start."""
+        self._reset()
+        for i in range(len(ema_states)):
+            ema_states[i] = float("nan")
+
+    @staticmethod
+    def _apply_ema(values: list[float], alpha: float) -> list[float]:
+        out, state = [], float("nan")
+        for v in values:
+            state = v if np.isnan(state) else alpha * v + (1 - alpha) * state
+            out.append(state)
+        return out
+
+    @staticmethod
+    def _otsu_between_class_var(values: np.ndarray) -> float:
+        hist, edges = np.histogram(values, bins=256, density=True)
+        centers = (edges[:-1] + edges[1:]) / 2
+        best = 0.0
+        for i in range(1, len(hist)):
+            w0, w1 = hist[:i].sum(), hist[i:].sum()
+            if w0 == 0 or w1 == 0:
+                continue
+            m0 = np.average(centers[:i], weights=hist[:i])
+            m1 = np.average(centers[i:], weights=hist[i:])
+            best = max(best, w0 * w1 * (m0 - m1) ** 2)
+        return best
+
     @staticmethod
     def _otsu_threshold(values: np.ndarray) -> float:
-        """Return Otsu's optimal threshold for a 1-D array.
-
-        Finds the split point that maximises between-class variance, assuming
-        a bimodal distribution of near-zero (motion) vs large (idle) values.
-
-        Parameters
-        ----------
-        values:
-            1-D array of non-negative floats (EMA-smoothed DTW increments).
-
-        Returns
-        -------
-        float
-            Threshold separating the two distribution modes.
-        """
         hist, edges = np.histogram(values, bins=256, density=True)
         centers = (edges[:-1] + edges[1:]) / 2
         best_t, best_var = edges[0], 0.0

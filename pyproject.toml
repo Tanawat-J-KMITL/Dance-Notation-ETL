@@ -13,4 +13,5 @@ dependencies = [
     "bvhio>=1.5.4",
     "pyglm>=2.8.2",
     "ipympl>=0.10.0",
+    "plotly>=6.8.0",
 ]
