@@ -77,7 +77,7 @@
 
       in {
         devShells.default = pkgs.mkShell {
-          buildInputs = [ venv pkgs.uv ] ++ runtimeLibs;
+          buildInputs = [ venv pkgs.uv pkgs.ffmpeg ] ++ runtimeLibs;
 
           shellHook = ''
             ln -sfn "${venv}" .venv

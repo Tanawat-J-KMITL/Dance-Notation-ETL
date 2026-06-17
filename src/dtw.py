@@ -229,7 +229,7 @@ class LiveDTW:
         self._lin_w     = lin_weight
         self._ang_w     = ang_weight
         self._N         = len(self._ref_lin)
-        self._band      = band if band is not None else self._N  # unconstrained = full N
+        self._band      = band if band is not None else self._N
         self._j         = 0
         self._incr      = float("inf")
         self._col       = self._init_col()
